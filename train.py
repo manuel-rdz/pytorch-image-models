@@ -16,6 +16,14 @@ Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
 """
 import argparse
 import time
+from timm.data.merged_dataset import MergedDataset
+from timm.utils.metrics import auc_score
+
+import numpy as np
+
+from pandas.core import base
+from timm.data.riadd_transforms import get_riadd_train_transforms, get_riadd_valid_transforms
+from timm.data.riadd_dataset import RiaddDataSet
 import yaml
 import os
 import logging
@@ -71,7 +79,7 @@ parser.add_argument('-c', '--config', default='', type=str, metavar='FILE',
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 
 # Dataset / Model parameters
-parser.add_argument('data_dir', metavar='DIR',
+parser.add_argument('--data_dir', metavar='DIR',
                     help='path to dataset')
 parser.add_argument('--dataset', '-d', metavar='NAME', default='',
                     help='dataset type (default: ImageFolder/ImageTar if empty)')
@@ -298,7 +306,7 @@ def _parse_args():
     return args, args_text
 
 
-def main():
+def main(fold_i = 0, data_ = None, train_index = None, val_index = None):
     setup_default_logging()
     args, args_text = _parse_args()
     
@@ -316,6 +324,7 @@ def main():
     args.device = 'cuda:0'
     args.world_size = 1
     args.rank = 0  # global rank
+    best_score = 0.0
     if args.distributed:
         args.device = 'cuda:%d' % args.local_rank
         torch.cuda.set_device(args.local_rank)
@@ -360,6 +369,7 @@ def main():
         bn_eps=args.bn_eps,
         scriptable=args.torchscript,
         checkpoint_path=args.initial_checkpoint)
+
     if args.num_classes is None:
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
         args.num_classes = model.num_classes  # FIXME handle model default vs config num_classes more elegantly
@@ -469,12 +479,24 @@ def main():
         _logger.info('Scheduled epochs: {}'.format(num_epochs))
 
     # create the train and eval datasets
-    dataset_train = create_dataset(
+    """dataset_train = create_dataset(
         args.dataset,
         root=args.data_dir, split=args.train_split, is_training=True,
         batch_size=args.batch_size, repeats=args.epoch_repeats)
     dataset_eval = create_dataset(
         args.dataset, root=args.data_dir, split=args.val_split, is_training=False, batch_size=args.batch_size)
+    """
+    train_trans = get_riadd_train_transforms(args)
+    valid_trans = get_riadd_valid_transforms(args)
+
+    train_data = data_.iloc[train_index, :].reset_index(drop=True)
+    val_data = data_.iloc[val_index, :].reset_index(drop=True) 
+
+    data_dir = ['C:/Users/AI/Desktop/student_Manuel/datasets/ARIA/all_images',
+    'C:/Users/AI/Desktop/student_Manuel/datasets/STARE/all-images']
+
+    dataset_train = MergedDataset(image_ids=train_data, baseImgPath=data_dir)
+    dataset_eval = MergedDataset(image_ids=val_data, baseImgPath=data_dir)
 
     # setup mixup / cutmix
     collate_fn = None
@@ -524,7 +546,8 @@ def main():
         distributed=args.distributed,
         collate_fn=collate_fn,
         pin_memory=args.pin_mem,
-        use_multi_epochs_loader=args.use_multi_epochs_loader
+        use_multi_epochs_loader=args.use_multi_epochs_loader,
+        transform=train_trans
     )
 
     loader_eval = create_loader(
@@ -540,9 +563,11 @@ def main():
         distributed=args.distributed,
         crop_pct=data_config['crop_pct'],
         pin_memory=args.pin_mem,
+        transform=valid_trans
     )
 
     # setup loss function
+    """
     if args.jsd:
         assert num_aug_splits > 1  # JSD only valid with aug splits set
         train_loss_fn = JsdCrossEntropy(num_splits=num_aug_splits, smoothing=args.smoothing).cuda()
@@ -554,6 +579,10 @@ def main():
     else:
         train_loss_fn = nn.CrossEntropyLoss().cuda()
     validate_loss_fn = nn.CrossEntropyLoss().cuda()
+    """
+
+    validate_loss_fn = nn.BCEWithLogitsLoss().cuda()
+    train_loss_fn = nn.BCEWithLogitsLoss().cuda()
 
     # setup checkpoint saver and eval metric tracking
     eval_metric = args.eval_metric
@@ -570,7 +599,7 @@ def main():
                 safe_model_name(args.model),
                 str(data_config['input_size'][-1])
             ])
-        output_dir = get_outdir(args.output if args.output else './output/train', exp_name)
+        output_dir = get_outdir(args.output if args.output else '/output/train', exp_name)
         decreasing = True if eval_metric == 'loss' else False
         saver = CheckpointSaver(
             model=model, optimizer=optimizer, args=args, model_ema=model_ema, amp_scaler=loss_scaler,
@@ -583,7 +612,7 @@ def main():
             if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
                 loader_train.sampler.set_epoch(epoch)
 
-            train_metrics = train_one_epoch(
+            train_metrics = train_epoch(
                 epoch, model, loader_train, optimizer, train_loss_fn, args,
                 lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
                 amp_autocast=amp_autocast, loss_scaler=loss_scaler, model_ema=model_ema, mixup_fn=mixup_fn)
@@ -594,6 +623,7 @@ def main():
                 distribute_bn(model, args.world_size, args.dist_bn == 'reduce')
 
             eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
+            score, scores = auc_score(eval_metrics['valid_label'], eval_metrics['predictions'])
 
             if model_ema is not None and not args.model_ema_force_cpu:
                 if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
@@ -604,17 +634,23 @@ def main():
 
             if lr_scheduler is not None:
                 # step LR for next epoch
-                lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
+                lr_scheduler.step(epoch + 1, score)
 
             if output_dir is not None:
                 update_summary(
                     epoch, train_metrics, eval_metrics, os.path.join(output_dir, 'summary.csv'),
                     write_header=best_metric is None, log_wandb=args.log_wandb and has_wandb)
 
-            if saver is not None:
+            if saver is not None and score > best_score:
                 # save proper checkpoint with eval metric
-                save_metric = eval_metrics[eval_metric]
+                #save_metric = eval_metrics[eval_metric]
+                #best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
+                best_score = score
+                save_metric = best_score
                 best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
+        del model
+        del optimizer
+        torch.cuda.empty_cache()
 
     except KeyboardInterrupt:
         pass
@@ -622,9 +658,9 @@ def main():
         _logger.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
 
 
-def train_one_epoch(
+def train_epoch(
         epoch, model, loader, optimizer, loss_fn, args,
-        lr_scheduler=None, saver=None, output_dir=None, amp_autocast=suppress,
+        lr_scheduler=None, saver=None, output_dir='', amp_autocast=suppress,
         loss_scaler=None, model_ema=None, mixup_fn=None):
 
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
@@ -648,6 +684,7 @@ def train_one_epoch(
         data_time_m.update(time.time() - end)
         if not args.prefetcher:
             input, target = input.cuda(), target.cuda()
+            target = target.float()
             if mixup_fn is not None:
                 input, target = mixup_fn(input, target)
         if args.channels_last:
@@ -663,16 +700,11 @@ def train_one_epoch(
         optimizer.zero_grad()
         if loss_scaler is not None:
             loss_scaler(
-                loss, optimizer,
-                clip_grad=args.clip_grad, clip_mode=args.clip_mode,
-                parameters=model_parameters(model, exclude_head='agc' in args.clip_mode),
-                create_graph=second_order)
+                loss, optimizer, clip_grad=args.clip_grad, parameters=model.parameters(), create_graph=second_order)
         else:
             loss.backward(create_graph=second_order)
             if args.clip_grad is not None:
-                dispatch_clip_grad(
-                    model_parameters(model, exclude_head='agc' in args.clip_mode),
-                    value=args.clip_grad, mode=args.clip_mode)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
             optimizer.step()
 
         if model_ema is not None:
@@ -732,20 +764,20 @@ def train_one_epoch(
 
 def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix=''):
     batch_time_m = AverageMeter()
-    losses_m = AverageMeter()
-    top1_m = AverageMeter()
-    top5_m = AverageMeter()
-
+    losses_m = AverageMeter()    
     model.eval()
-
+    preds = []  
+    valid_label_ = []
     end = time.time()
     last_idx = len(loader) - 1
+
     with torch.no_grad():
         for batch_idx, (input, target) in enumerate(loader):
             last_batch = batch_idx == last_idx
             if not args.prefetcher:
                 input = input.cuda()
                 target = target.cuda()
+                target = target.float()
             if args.channels_last:
                 input = input.contiguous(memory_format=torch.channels_last)
 
@@ -761,20 +793,17 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                 target = target[0:target.size(0):reduce_factor]
 
             loss = loss_fn(output, target)
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
             if args.distributed:
                 reduced_loss = reduce_tensor(loss.data, args.world_size)
-                acc1 = reduce_tensor(acc1, args.world_size)
-                acc5 = reduce_tensor(acc5, args.world_size)
             else:
                 reduced_loss = loss.data
 
             torch.cuda.synchronize()
 
             losses_m.update(reduced_loss.item(), input.size(0))
-            top1_m.update(acc1.item(), output.size(0))
-            top5_m.update(acc5.item(), output.size(0))
+            preds.append(output.sigmoid().to('cpu').numpy())
+            valid_label_.append(target.to('cpu').numpy())
 
             batch_time_m.update(time.time() - end)
             end = time.time()
@@ -783,16 +812,25 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                 _logger.info(
                     '{0}: [{1:>4d}/{2}]  '
                     'Time: {batch_time.val:.3f} ({batch_time.avg:.3f})  '
-                    'Loss: {loss.val:>7.4f} ({loss.avg:>6.4f})  '
-                    'Acc@1: {top1.val:>7.4f} ({top1.avg:>7.4f})  '
-                    'Acc@5: {top5.val:>7.4f} ({top5.avg:>7.4f})'.format(
+                    'Loss: {loss.val:>7.4f} ({loss.avg:>6.4f})'.format(
                         log_name, batch_idx, last_idx, batch_time=batch_time_m,
-                        loss=losses_m, top1=top1_m, top5=top5_m))
+                        loss=losses_m))
 
-    metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)])
+    predictions = np.concatenate(preds)
+    valid_label_ =  np.concatenate(valid_label_)
 
+    metrics = OrderedDict([('loss', losses_m.avg), ('predictions', predictions),('valid_label',valid_label_)])
     return metrics
 
 
 if __name__ == '__main__':
-    main()
+    from sklearn.model_selection import KFold
+    from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
+    import pandas as pd
+
+    args, args_text = _parse_args()
+    folds = MultilabelStratifiedKFold(n_splits=5, shuffle=True, random_state=args.seed)
+    data_ = pd.read_csv('C:/Users/AI/Desktop/student_Manuel/datasets/clean_merged_dataset_only_2.csv')
+
+    for fold_i, (train_index, val_index) in enumerate(folds.split(data_, data_.iloc[:, 3:])):
+        main(fold_i, data_, train_index, val_index)

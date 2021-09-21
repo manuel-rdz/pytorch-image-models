@@ -155,36 +155,40 @@ def create_loader(
         tf_preprocessing=False,
         use_multi_epochs_loader=False,
         persistent_workers=True,
+        transform=None,
 ):
     re_num_splits = 0
     if re_split:
         # apply RE to second half of batch if no aug split otherwise line up with aug split
         re_num_splits = num_aug_splits or 2
-    dataset.transform = create_transform(
-        input_size,
-        is_training=is_training,
-        use_prefetcher=use_prefetcher,
-        no_aug=no_aug,
-        scale=scale,
-        ratio=ratio,
-        hflip=hflip,
-        vflip=vflip,
-        color_jitter=color_jitter,
-        auto_augment=auto_augment,
-        interpolation=interpolation,
-        mean=mean,
-        std=std,
-        crop_pct=crop_pct,
-        tf_preprocessing=tf_preprocessing,
-        re_prob=re_prob,
-        re_mode=re_mode,
-        re_count=re_count,
-        re_num_splits=re_num_splits,
-        separate=num_aug_splits > 0,
-    )
+    if transform == None:
+        dataset.transform = create_transform(
+            input_size,
+            is_training=is_training,
+            use_prefetcher=use_prefetcher,
+            no_aug=no_aug,
+            scale=scale,
+            ratio=ratio,
+            hflip=hflip,
+            vflip=vflip,
+            color_jitter=color_jitter,
+            auto_augment=auto_augment,
+            interpolation=interpolation,
+            mean=mean,
+            std=std,
+            crop_pct=crop_pct,
+            tf_preprocessing=tf_preprocessing,
+            re_prob=re_prob,
+            re_mode=re_mode,
+            re_count=re_count,
+            re_num_splits=re_num_splits,
+            separate=num_aug_splits > 0,
+        )
+    else:
+        dataset.transform = transform
 
     sampler = None
-    if distributed and not isinstance(dataset, torch.utils.data.IterableDataset):
+    if distributed:
         if is_training:
             sampler = torch.utils.data.distributed.DistributedSampler(dataset)
         else:
@@ -200,20 +204,16 @@ def create_loader(
     if use_multi_epochs_loader:
         loader_class = MultiEpochsDataLoader
 
-    loader_args = dict(
+    loader = loader_class(
+        dataset,
         batch_size=batch_size,
-        shuffle=not isinstance(dataset, torch.utils.data.IterableDataset) and sampler is None and is_training,
+        shuffle=sampler is None and is_training,
         num_workers=num_workers,
         sampler=sampler,
         collate_fn=collate_fn,
         pin_memory=pin_memory,
         drop_last=is_training,
-        persistent_workers=persistent_workers)
-    try:
-        loader = loader_class(dataset, **loader_args)
-    except TypeError as e:
-        loader_args.pop('persistent_workers')  # only in Pytorch 1.7+
-        loader = loader_class(dataset, **loader_args)
+    )
     if use_prefetcher:
         prefetch_re_prob = re_prob if is_training and not no_aug else 0.
         loader = PrefetchLoader(
